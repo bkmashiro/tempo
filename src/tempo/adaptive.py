@@ -110,6 +110,24 @@ class PolicySet:
                     ),
                     description="Moderate token bucket for steady batch",
                 ),
+                RequestPattern.CRAWLER: Policy(
+                    pattern=RequestPattern.CRAWLER,
+                    limiter_factory=lambda c: LeakyBucketLimiter(
+                        capacity=int(base_rate * 0.7),
+                        drain_rate=base_rate * 0.7 / window,
+                        clock=c,
+                    ),
+                    description="Moderate leaky bucket for crawlers",
+                ),
+                RequestPattern.DDOS: Policy(
+                    pattern=RequestPattern.DDOS,
+                    limiter_factory=lambda c: LeakyBucketLimiter(
+                        capacity=max(1, int(base_rate * 0.1)),
+                        drain_rate=base_rate * 0.1 / window,
+                        clock=c,
+                    ),
+                    description="Very strict leaky bucket for DDoS",
+                ),
             },
             default_policy=Policy(
                 pattern=RequestPattern.UNKNOWN,
@@ -168,6 +186,24 @@ class PolicySet:
                         clock=c,
                     ),
                     description="Moderate leaky bucket for steady batch",
+                ),
+                RequestPattern.CRAWLER: Policy(
+                    pattern=RequestPattern.CRAWLER,
+                    limiter_factory=lambda c: LeakyBucketLimiter(
+                        capacity=max(1, int(base_rate * 0.3)),
+                        drain_rate=base_rate * 0.3 / window,
+                        clock=c,
+                    ),
+                    description="Strict leaky bucket for crawlers",
+                ),
+                RequestPattern.DDOS: Policy(
+                    pattern=RequestPattern.DDOS,
+                    limiter_factory=lambda c: LeakyBucketLimiter(
+                        capacity=1,
+                        drain_rate=0.01,
+                        clock=c,
+                    ),
+                    description="Near-total block for DDoS",
                 ),
             },
             default_policy=Policy(

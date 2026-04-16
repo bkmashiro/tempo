@@ -11,7 +11,15 @@ from tempo.limiters import (
     TokenBucketLimiter,
     LeakyBucketLimiter,
 )
-from tempo.detector import RhythmDetector, RequestPattern
+from tempo.detector import (
+    RhythmDetector,
+    RequestPattern,
+    RollingClassifier,
+    RollingClassification,
+    BotAlert,
+    check_bot_alert,
+    export_nginx_rules,
+)
 from tempo.adaptive import AdaptiveRateLimiter, Policy, PolicySet
 from tempo.clock import Clock, MonotonicClock, ManualClock
 
@@ -24,6 +32,11 @@ __all__ = [
     "LeakyBucketLimiter",
     "RhythmDetector",
     "RequestPattern",
+    "RollingClassifier",
+    "RollingClassification",
+    "BotAlert",
+    "check_bot_alert",
+    "export_nginx_rules",
     "AdaptiveRateLimiter",
     "Policy",
     "PolicySet",
