@@ -47,6 +47,8 @@ class RequestPattern(Enum):
     BOT_PERIODIC = auto()
     BATCH_RAMP = auto()
     BATCH_STEADY = auto()
+    CRAWLER = auto()
+    DDOS = auto()
 
 
 @dataclass
@@ -67,6 +69,12 @@ class PatternAnalysis:
     burst_ratio: float = 0.0  # fraction of intervals below burst threshold
     trend_slope: float = 0.0  # linear trend in interval times
 
+    # Confidence distribution across all patterns
+    confidence_distribution: dict = field(default_factory=dict)
+
+    # Feature importance: which features contributed most to the classification
+    feature_importance: dict = field(default_factory=dict)
+
     def __repr__(self) -> str:
         return (
             f"PatternAnalysis(pattern={self.pattern.name}, "
@@ -74,6 +82,37 @@ class PatternAnalysis:
             f"cv={self.cv:.3f}, entropy={self.entropy:.3f}, "
             f"autocorr={self.autocorrelation_peak:.3f}@lag{self.autocorrelation_lag})"
         )
+
+    def format_confidence_distribution(self) -> str:
+        """Format the confidence distribution as a readable string."""
+        if not self.confidence_distribution:
+            return "  No distribution data"
+        lines = []
+        sorted_items = sorted(
+            self.confidence_distribution.items(),
+            key=lambda x: x[1], reverse=True,
+        )
+        max_score = max(self.confidence_distribution.values()) if self.confidence_distribution else 1.0
+        for name, score in sorted_items:
+            bar_len = int(score / max(max_score, 0.01) * 30)
+            bar = "█" * bar_len
+            lines.append(f"  {name:<16} {bar} {score:.3f}")
+        return "\n".join(lines)
+
+    def format_feature_importance(self) -> str:
+        """Format feature importance as a readable string."""
+        if not self.feature_importance:
+            return "  No feature data"
+        lines = []
+        sorted_items = sorted(
+            self.feature_importance.items(),
+            key=lambda x: x[1], reverse=True,
+        )
+        for name, weight in sorted_items:
+            bar_len = int(weight * 40)
+            bar = "▓" * bar_len
+            lines.append(f"  {name:<20} {bar} {weight:.3f}")
+        return "\n".join(lines)
 
 
 # Seed-derived defaults
@@ -183,7 +222,7 @@ class RhythmDetector:
         trend_slope = self._compute_trend_slope(intervals)
 
         # Classification logic
-        pattern, confidence = self._classify(
+        pattern, confidence, conf_dist, feat_importance = self._classify(
             cv=cv,
             entropy=entropy,
             ac_peak=ac_peak,
@@ -204,6 +243,8 @@ class RhythmDetector:
             autocorrelation_lag=ac_lag,
             burst_ratio=burst_ratio,
             trend_slope=trend_slope,
+            confidence_distribution=conf_dist,
+            feature_importance=feat_importance,
         )
         self._cached_analysis = result
         self._cache_valid = True
@@ -325,11 +366,12 @@ class RhythmDetector:
         burst_ratio: float,
         trend_slope: float,
         mean_interval: float,
-    ) -> Tuple[RequestPattern, float]:
+    ) -> Tuple[RequestPattern, float, dict, dict]:
         """
         Multi-signal classification.
 
         Combines all metrics into a pattern classification with confidence.
+        Returns (pattern, confidence, confidence_distribution, feature_importance).
         """
         cfg = self.config
         scores = {
@@ -337,79 +379,140 @@ class RhythmDetector:
             RequestPattern.HUMAN_BURSTY: 0.0,
             RequestPattern.BATCH_RAMP: 0.0,
             RequestPattern.BATCH_STEADY: 0.0,
+            RequestPattern.CRAWLER: 0.0,
+            RequestPattern.DDOS: 0.0,
+        }
+
+        # Track which features contribute to each score for feature importance
+        feature_contributions: dict = {
+            "cv": 0.0,
+            "entropy": 0.0,
+            "autocorrelation": 0.0,
+            "burst_ratio": 0.0,
+            "trend_slope": 0.0,
+            "mean_interval": 0.0,
         }
 
         # Detect whether there is a strong monotonic trend (ramp).
-        # A ramp naturally produces high lag-1 autocorrelation because
-        # consecutive intervals are similar — but that is NOT periodicity.
         has_strong_trend = abs(trend_slope) > cfg.ramp_slope_threshold
 
         # --- Bot periodic signals ---
-        # Suppress bot score when a strong trend is present, since the
-        # high autocorrelation is explained by the ramp, not periodicity.
         if not has_strong_trend:
             if cv < cfg.cv_threshold * 0.5:
                 scores[RequestPattern.BOT_PERIODIC] += 0.35
+                feature_contributions["cv"] += 0.35
             elif cv < cfg.cv_threshold:
                 scores[RequestPattern.BOT_PERIODIC] += 0.15
+                feature_contributions["cv"] += 0.15
 
             if ac_peak > cfg.autocorr_threshold:
                 scores[RequestPattern.BOT_PERIODIC] += 0.35
+                feature_contributions["autocorrelation"] += 0.35
             elif ac_peak > cfg.autocorr_threshold * 0.6:
                 scores[RequestPattern.BOT_PERIODIC] += 0.15
+                feature_contributions["autocorrelation"] += 0.15
 
             if entropy < cfg.entropy_low:
                 scores[RequestPattern.BOT_PERIODIC] += 0.30
+                feature_contributions["entropy"] += 0.30
         else:
-            # Even with a trend, perfectly low CV still gets a small bot score
             if cv < cfg.cv_threshold * 0.2 and abs(trend_slope) < cfg.ramp_slope_threshold * 1.5:
                 scores[RequestPattern.BOT_PERIODIC] += 0.20
+                feature_contributions["cv"] += 0.10
+                feature_contributions["trend_slope"] += 0.10
 
         # --- Human bursty signals ---
         if cv > cfg.cv_threshold:
             scores[RequestPattern.HUMAN_BURSTY] += 0.25
+            feature_contributions["cv"] += 0.25
         if cv > cfg.cv_threshold * 1.5:
             scores[RequestPattern.HUMAN_BURSTY] += 0.10
+            feature_contributions["cv"] += 0.10
 
         if burst_ratio > 0.3:
             scores[RequestPattern.HUMAN_BURSTY] += 0.25
+            feature_contributions["burst_ratio"] += 0.25
         if burst_ratio > 0.5:
             scores[RequestPattern.HUMAN_BURSTY] += 0.10
+            feature_contributions["burst_ratio"] += 0.10
 
         if entropy > cfg.entropy_high:
             scores[RequestPattern.HUMAN_BURSTY] += 0.20
+            feature_contributions["entropy"] += 0.20
 
         if ac_peak < cfg.autocorr_threshold * 0.4:
             scores[RequestPattern.HUMAN_BURSTY] += 0.10
+            feature_contributions["autocorrelation"] += 0.10
 
         # --- Batch ramp signals ---
-        # A ramp has a clear trend but NOT extreme CV (that would be bursts).
-        # Ramps have moderate CV because the intervals change gradually.
         is_moderate_cv = cv < cfg.cv_threshold * 2.0
         if has_strong_trend and is_moderate_cv:
             scores[RequestPattern.BATCH_RAMP] += 0.45
+            feature_contributions["trend_slope"] += 0.45
         if abs(trend_slope) > cfg.ramp_slope_threshold * 2 and is_moderate_cv:
             scores[RequestPattern.BATCH_RAMP] += 0.25
+            feature_contributions["trend_slope"] += 0.25
         elif abs(trend_slope) > cfg.ramp_slope_threshold * 0.5 and is_moderate_cv:
             scores[RequestPattern.BATCH_RAMP] += 0.10
+            feature_contributions["trend_slope"] += 0.10
 
         if has_strong_trend and cv > cfg.cv_threshold * 0.3 and is_moderate_cv:
             scores[RequestPattern.BATCH_RAMP] += 0.15
+            feature_contributions["cv"] += 0.15
 
         # --- Batch steady signals ---
         if cv < cfg.cv_threshold * 0.3:
             scores[RequestPattern.BATCH_STEADY] += 0.30
-
+            feature_contributions["cv"] += 0.15
         if entropy < cfg.entropy_low * 0.8:
             scores[RequestPattern.BATCH_STEADY] += 0.20
-
+            feature_contributions["entropy"] += 0.10
         if ac_peak < cfg.autocorr_threshold * 0.3:
-            # Low autocorrelation + low CV = steady but not periodic
             if cv < cfg.cv_threshold * 0.3:
                 scores[RequestPattern.BATCH_STEADY] += 0.20
-
-        if mean_interval < 0.1:  # Very fast requests
+                feature_contributions["autocorrelation"] += 0.10
+        if mean_interval < 0.1:
             scores[RequestPattern.BATCH_STEADY] += 0.15
+            feature_contributions["mean_interval"] += 0.15
+
+        # --- Crawler signals ---
+        # Crawlers: moderate periodicity, slightly irregular, spread-out intervals
+        # They look like slow bots but with more variance
+        if 0.2 < cv < cfg.cv_threshold and mean_interval > 1.0:
+            scores[RequestPattern.CRAWLER] += 0.25
+            feature_contributions["cv"] += 0.10
+            feature_contributions["mean_interval"] += 0.15
+        if ac_peak > cfg.autocorr_threshold * 0.4 and ac_peak < cfg.autocorr_threshold:
+            scores[RequestPattern.CRAWLER] += 0.20
+            feature_contributions["autocorrelation"] += 0.10
+        if cfg.entropy_low < entropy < cfg.entropy_high and mean_interval > 0.5:
+            scores[RequestPattern.CRAWLER] += 0.20
+            feature_contributions["entropy"] += 0.10
+        if burst_ratio < 0.1 and mean_interval > 1.0:
+            scores[RequestPattern.CRAWLER] += 0.15
+            feature_contributions["burst_ratio"] += 0.05
+            feature_contributions["mean_interval"] += 0.10
+
+        # --- DDOS signals ---
+        # DDoS: extremely fast AND chaotic or extremely fast with high volume.
+        # Distinguish from BATCH_STEADY which is also fast but has low CV.
+        # DDoS typically has high entropy or high burst ratio (chaotic flooding).
+        is_chaotic = entropy > cfg.entropy_high or burst_ratio > 0.5 or cv > cfg.cv_threshold * 0.5
+        if mean_interval < 0.005:
+            # Sub-5ms intervals: almost certainly DDoS regardless of regularity
+            scores[RequestPattern.DDOS] += 0.40
+            feature_contributions["mean_interval"] += 0.40
+        elif mean_interval < 0.02 and is_chaotic:
+            scores[RequestPattern.DDOS] += 0.30
+            feature_contributions["mean_interval"] += 0.15
+            feature_contributions["entropy"] += 0.15
+        if mean_interval < 0.02 and burst_ratio > 0.6:
+            scores[RequestPattern.DDOS] += 0.30
+            feature_contributions["burst_ratio"] += 0.15
+            feature_contributions["mean_interval"] += 0.15
+        if mean_interval < 0.02 and cv > cfg.cv_threshold:
+            scores[RequestPattern.DDOS] += 0.15
+            feature_contributions["cv"] += 0.15
 
         # Pick winner
         best_pattern = max(scores, key=scores.get)  # type: ignore[arg-type]
@@ -423,10 +526,186 @@ class RhythmDetector:
         else:
             confidence = best_score
 
-        if best_score < 0.15:
-            return RequestPattern.UNKNOWN, confidence
+        # Build confidence distribution (normalized scores)
+        total_score = sum(scores.values())
+        conf_dist = {}
+        for pattern, score in scores.items():
+            conf_dist[pattern.name] = score / total_score if total_score > 0 else 0.0
 
-        return best_pattern, min(1.0, confidence)
+        # Normalize feature importance
+        total_feat = sum(feature_contributions.values())
+        feat_importance = {}
+        if total_feat > 0:
+            for feat, weight in feature_contributions.items():
+                feat_importance[feat] = weight / total_feat
+
+        if best_score < 0.15:
+            return RequestPattern.UNKNOWN, confidence, conf_dist, feat_importance
+
+        return best_pattern, min(1.0, confidence), conf_dist, feat_importance
+
+
+@dataclass
+class RollingClassification:
+    """Result of rolling window classification."""
+    window_start: float
+    window_end: float
+    analysis: PatternAnalysis
+    changed: bool = False  # True if pattern changed from previous window
+
+
+class RollingClassifier:
+    """
+    Time-windowed rolling classification.
+
+    Splits timestamps into windows and classifies each independently,
+    detecting pattern changes over time.
+    """
+
+    def __init__(
+        self,
+        window_seconds: float = 60.0,
+        config: Optional[DetectorConfig] = None,
+    ):
+        self.window_seconds = window_seconds
+        self.config = config or DetectorConfig()
+
+    def classify_windows(
+        self, timestamps: List[float],
+    ) -> List[RollingClassification]:
+        """Classify timestamps in rolling windows."""
+        if not timestamps:
+            return []
+
+        sorted_ts = sorted(timestamps)
+        start = sorted_ts[0]
+        end = sorted_ts[-1]
+
+        results: List[RollingClassification] = []
+        prev_pattern = RequestPattern.UNKNOWN
+        window_start = start
+
+        while window_start < end:
+            window_end = window_start + self.window_seconds
+            window_ts = [t for t in sorted_ts if window_start <= t < window_end]
+
+            detector = RhythmDetector(config=self.config)
+            for t in window_ts:
+                detector.record(t)
+
+            analysis = detector.analyze()
+            changed = analysis.pattern != prev_pattern and prev_pattern != RequestPattern.UNKNOWN
+
+            results.append(RollingClassification(
+                window_start=window_start,
+                window_end=window_end,
+                analysis=analysis,
+                changed=changed,
+            ))
+            prev_pattern = analysis.pattern
+            window_start = window_end
+
+        return results
+
+
+@dataclass
+class BotAlert:
+    """Alert triggered when bot-like patterns are detected."""
+    key: str
+    pattern: RequestPattern
+    confidence: float
+    analysis: PatternAnalysis
+    message: str
+
+
+def check_bot_alert(
+    analysis: PatternAnalysis,
+    key: str = "unknown",
+    threshold: float = 0.7,
+) -> Optional[BotAlert]:
+    """
+    Check if an analysis result warrants a bot alert.
+
+    Returns a BotAlert if the pattern is bot-like (BOT_PERIODIC, CRAWLER,
+    or DDOS) and confidence exceeds the threshold.
+    """
+    bot_patterns = {RequestPattern.BOT_PERIODIC, RequestPattern.CRAWLER, RequestPattern.DDOS}
+    if analysis.pattern in bot_patterns and analysis.confidence >= threshold:
+        return BotAlert(
+            key=key,
+            pattern=analysis.pattern,
+            confidence=analysis.confidence,
+            analysis=analysis,
+            message=(
+                f"Bot-like traffic detected for {key}: "
+                f"{analysis.pattern.name} (confidence={analysis.confidence:.2f})"
+            ),
+        )
+    return None
+
+
+def export_nginx_rules(
+    analyses: dict,
+    block_patterns: Optional[set] = None,
+    rate_limit_rps: int = 10,
+) -> str:
+    """
+    Export nginx rate-limiting configuration rules based on classification results.
+
+    Args:
+        analyses: Dict mapping key (IP/client) to PatternAnalysis.
+        block_patterns: Set of RequestPattern to block outright (default: DDOS).
+        rate_limit_rps: Requests per second for rate-limited patterns.
+
+    Returns:
+        nginx configuration snippet as a string.
+    """
+    if block_patterns is None:
+        block_patterns = {RequestPattern.DDOS}
+
+    lines = [
+        "# Auto-generated by Tempo rhythm detection",
+        "# Adaptive rate limiting rules",
+        "",
+        f"limit_req_zone $binary_remote_addr zone=tempo_bot:10m rate={rate_limit_rps}r/s;",
+        f"limit_req_zone $binary_remote_addr zone=tempo_crawler:10m rate={rate_limit_rps * 2}r/s;",
+        "",
+    ]
+
+    deny_ips = []
+    bot_ips = []
+    crawler_ips = []
+
+    for key, analysis in analyses.items():
+        if analysis.pattern in block_patterns:
+            deny_ips.append(key)
+        elif analysis.pattern == RequestPattern.BOT_PERIODIC:
+            bot_ips.append(key)
+        elif analysis.pattern == RequestPattern.CRAWLER:
+            crawler_ips.append(key)
+
+    if deny_ips:
+        lines.append("# Blocked IPs (DDoS / malicious)")
+        for ip in deny_ips:
+            lines.append(f"deny {ip};")
+        lines.append("")
+
+    if bot_ips or crawler_ips:
+        lines.append("# Rate-limited IPs")
+        lines.append("map $remote_addr $tempo_zone {")
+        lines.append("    default '';")
+        for ip in bot_ips:
+            lines.append(f"    {ip} tempo_bot;")
+        for ip in crawler_ips:
+            lines.append(f"    {ip} tempo_crawler;")
+        lines.append("}")
+        lines.append("")
+        lines.append("# Apply in server block:")
+        lines.append("# if ($tempo_zone = tempo_bot) {")
+        lines.append(f"#     limit_req zone=tempo_bot burst={rate_limit_rps * 2} nodelay;")
+        lines.append("# }")
+
+    return "\n".join(lines)
 
 
 def _mean(values: List[float]) -> float:
